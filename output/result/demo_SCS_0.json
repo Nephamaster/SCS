@@ -1,0 +1,27 @@
+{
+  "dataset_name": "demo",
+  "SCE": 0.4172249106598542,
+  "SCE_wo_cohesion": 0.41690225631594396,
+  "SCE_wo_cohesion_wo_generator": 0.3803900850226951,
+  "class_num": 3,
+  "class_content": {
+    "class_0": {
+      "percentage": 0.114,
+      "ln_probability": 0.12942573896308618,
+      "cohesion": 0.130080972741893,
+      "avg_token_num": 1022.3333333333334
+    },
+    "class_1": {
+      "percentage": 0.882,
+      "ln_probability": 0.8654137960987708,
+      "cohesion": 0.8649376704078503,
+      "avg_token_num": 1316.4251700680272
+    },
+    "class_2": {
+      "percentage": 0.004,
+      "ln_probability": 0.005160464938143128,
+      "cohesion": 0.004981356850256604,
+      "avg_token_num": 862.5
+    }
+  }
+}

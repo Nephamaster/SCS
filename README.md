@@ -1,1 +1,1 @@
-# SCS-Semantic-Cohesion-State
+# SCS: Semantic Cohesion State
