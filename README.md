@@ -64,13 +64,17 @@ python entropy.py --dataset <DATASET> \
 ```
 
 `dataset`: your IT dataset name
+
 `generator`: Hugging Face model ID or local path for generation probability (e.g., `meta-llama/Llama-3.1-8B`)
+
 `embedder`: Hugging Face model ID or local path for semantic embeddings (e.g., `BAAI/bge-small-en-v1.5`)
 
 ### 4. Check the result
 
 the clusters of your dataset saved in `output/cluster/<DATASET>.json`
+
 the intrinsic generation probabilities and semantic embeddings saved in `output/feature/<DATASET>`
+
 the SCS score saved in `output/result/<DATASET>_SCS_0.json`
 
 ## Citation
