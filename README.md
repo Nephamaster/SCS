@@ -42,7 +42,7 @@ Your instruction-tuning dataset should follow the **ShareGPT format**:
 ```
 
 - Save your dataset as `data/raw/<DATASET>.json`
-- Refer to `data/demo.json` for a minimal working example.
+- Refer to `data/raw/demo.json` for a minimal working example.
 
 ### 2. Preprocess the data
 
