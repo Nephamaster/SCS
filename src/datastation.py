@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 from transformers import AutoTokenizer
 
 
@@ -30,3 +31,13 @@ class DatasetAnalyzer:
         return tokens, token_nums, avg_token_num
 
 
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Preprocessing dataset")
+    parser.add_argument(
+        "dataset",
+        type=str,
+        help="Name of the dataset"
+    )
+    args = parser.parse_args()
+    analyzer = DatasetAnalyzer(args.dataset)
+    analyzer.flatten()

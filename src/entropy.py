@@ -1,4 +1,6 @@
 import os
+import sys
+import argparse
 import numpy as np
 from cluster import cluster_const
 from utils import *
@@ -140,4 +142,28 @@ def pipeline(dataset:str,
 
 
 if __name__ == '__main__':
-    pipeline('demo')
+    parser = argparse.ArgumentParser(description="Run the SCS evaluation pipeline.")
+    parser.add_argument(
+        "dataset",
+        type=str,
+        help="Name of the dataset"
+    )
+    parser.add_argument(
+        "--generator",
+        type=str,
+        default="meta-llama/Llama-3.1-8B",
+        help="Model used for gaining intrinsic generation probabalities"
+    )
+    parser.add_argument(
+        "--embedder",
+        type=str,
+        default="BAAI/bge-small-en-v1.5",
+        help="Model used for gaining semantic embedding"
+    )
+
+    args = parser.parse_args()
+    pipeline(
+        dataset=args.dataset,
+        generator=args.generator,
+        embedder=args.embedder
+    )

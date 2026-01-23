@@ -1,0 +1,5 @@
+transformers
+torch
+tqdm
+hdbscan
+umap-learn
