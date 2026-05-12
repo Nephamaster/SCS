@@ -7,19 +7,23 @@ import sqlite3
 import pickle
 import string
 import hashlib
-import torch
 import numpy as np
 from tqdm import tqdm
-from extractor import Extractor
 from datastation import DatasetAnalyzer
 
 
 # if you want to use local models, fill it in here
+# MODEL_LIST = {
+#     'meta-llama/Llama-3.1-8B': '/mnt/disk4t/heyuxuan/data/models/meta-llama/Llama-3.1-8B',
+#     'Qwen/Qwen3-8B-Base': '/mnt/disk4t/heyuxuan/data/models/Qwen/Qwen3-8b-Base',
+#     'google-bert/bert-base-uncased': '/mnt/disk4t/heyuxuan/data/models/bert-base-uncased',
+#     'FacebookAI/xlm-roberta-large': '/mnt/disk4t/heyuxuan/data/models/FacebookAI/xlm-roberta-large',
+# }
 MODEL_LIST = {
-    'meta-llama/Llama-3.1-8B': '/mnt/disk4t/heyuxuan/data/models/meta-llama/Llama-3.1-8B',
-    'Qwen/Qwen3-8B-Base': '/mnt/disk4t/heyuxuan/data/models/Qwen/Qwen3-8b-Base',
-    'google-bert/bert-base-uncased': '/mnt/disk4t/heyuxuan/data/models/bert-base-uncased',
-    'FacebookAI/xlm-roberta-large': '/mnt/disk4t/heyuxuan/data/models/FacebookAI/xlm-roberta-large',
+    'meta-llama/Llama-3.1-8B': '/share/project/wuhaiming/data/models/meta-llama/Llama-3.1-8B',
+    'Qwen/Qwen3-8B-Base': '/share/project/wuhaiming/data/models/Qwen3-8B-Base',
+    'google-bert/bert-base-uncased': '/share/project/wuhaiming/data/models/bert-base-uncased',
+    'FacebookAI/xlm-roberta-large': '/share/project/wuhaiming/data/models/xlm-roberta-large',
 }
 TAGS_CHOOSE = string.ascii_uppercase
 
@@ -81,8 +85,8 @@ def read_feature(read_dir:str):
     rows = cursor.fetchall()
     features = {}
     for i, row in enumerate(rows):
-        embedding = pickle.loads(row[1])
-        ln_probability = row[2]
+        embedding = pickle.loads(row[3])
+        ln_probability = row[4]
         features[i] = {
             'embedding': embedding,
             'ln_probability': ln_probability
@@ -92,6 +96,8 @@ def read_feature(read_dir:str):
 
 
 def feature_const(dataset:str, generator_name:str, embedder_name:str):
+    import torch
+    from extractor import Extractor
     data_list = load_json(f'../data/{dataset}.json')
     print('Data length: ', len(data_list))
     embedder_new_name = MODEL_LIST[embedder_name] if embedder_name in MODEL_LIST else embedder_name

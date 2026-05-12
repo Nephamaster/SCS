@@ -110,8 +110,8 @@ def main():
     )
     parser.add_argument("--text_dir", type=str, required=True,
                        help="Directory containing text data")
-    parser.add_argument("--figure_dir", type=str, required=True,
-                       help="Base directory for embedding figures")
+    # parser.add_argument("--figure_dir", type=str, required=True,
+    #                    help="Base directory for embedding figures")
     parser.add_argument("--output_dir", type=str, required=True,
                        help="Base directory for output")
     parser.add_argument("--k", type=int, default=10000,
@@ -126,14 +126,16 @@ def main():
                        help="GPU ID to use (0-indexed)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for reproducibility")
+    parser.add_argument("--batch_size", type=int, default=8192,
+                       help="Batch size for computing distances")
     args = parser.parse_args()
     set_seed(args.seed)
 
     print(f"Loading text data from {args.text_dir}")
     text = load_dir_text_data(args.text_dir)
-    print(f"Loading embeddings from {args.figure_dir}")
+    # print(f"Loading embeddings from {args.figure_dir}")
     # embeddings = load_dir_data(args.figure_dir)
-    features = read_feature('../sce/output/feature/SFT_1.db')
+    features = read_feature('../../output/feature/SFT.db')
     embeddings = [features[i]['embedding'] for i in range(len(features))]
     embeddings = np.array(embeddings)
     print(f"Loaded embeddings: {embeddings.shape}, text: {len(text)} items")
@@ -148,7 +150,8 @@ def main():
         neighbors=args.neighbors,
         density_power=args.density_power,
         distance_power=args.distance_power,
-        seed=args.seed
+        seed=args.seed,
+        batch_size=args.batch_size
     )
     
     # selected_text = text[centers_indices].tolist()
@@ -161,3 +164,4 @@ def main():
 if __name__ == "__main__":
     main()
 # start 12-20 18:35
+# CUDA_VISIBLE_DEVICES=0 python novelselect.py --text_dir ../../data/novel/SFT_text.json --output_dir SFT_novel_10000

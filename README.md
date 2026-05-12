@@ -77,6 +77,30 @@ the intrinsic generation probabilities and semantic embeddings saved in `output/
 
 the SCS score saved in `output/result/<DATASET>_SCS_0.json`
 
+## SCS Data Selection
+
+After preprocessing, feature extraction, and clustering are complete, you can select a
+subset by Semantic Cohesion Weight from the repository root:
+
+```bash
+python data_selection/scs_select.py <DATASET> \
+                                    --sample_size <SAMPLE_SIZE>
+```
+
+The selector sorts samples inside each semantic cluster by the Semantic Cohesion
+Weight from `src/entropy.py` (`cohesion_weights`) in descending order, then selects
+samples by rotating across clusters: cluster 0 top sample, cluster 1 top sample,
+..., then back to cluster 0 for the next sample. The default output is saved to
+`output/selection/<DATASET>_scs_<SAMPLE_SIZE>.json`.
+
+Optional arguments:
+
+```bash
+--source raw|processed
+--output <OUTPUT_JSON>
+--metadata_output <METADATA_JSON>
+```
+
 ## Citation
 
 If you find this work useful, please cite our paper:

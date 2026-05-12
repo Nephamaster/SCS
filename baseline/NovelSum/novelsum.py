@@ -45,7 +45,7 @@ def novelsum(distance_matrix: np.ndarray, densities: np.ndarray, power: float = 
 def process_model(dataset_path: str, dataset_name: str, faiss_index: FaissIndex, device: torch.device,
                   density_powers: List[float], neighbors: List[int], distance_powers: List[float]) -> Dict:
     # dataset = load_data(dataset_path)
-    features = read_feature(f'../sce/output/feature/{dataset_name}.db')
+    features = read_feature(f'../../output/feature/{dataset_name}.db')
     embeddings = [features[i]['embedding'] for i in range(len(features))]
     # dataset = normalize(embeddings)
     dataset = np.array(embeddings)
