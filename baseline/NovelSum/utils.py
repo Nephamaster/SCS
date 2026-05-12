@@ -3,9 +3,7 @@ import random
 import pathlib
 import numpy as np
 import torch
-import pickle as pk
 import faiss
-import sqlite3
 import os
 from tqdm import tqdm
 
@@ -36,14 +34,12 @@ class FaissIndex:
         self.data = np.unique(self.data, axis=0)  # Remove duplicates
         self.res = faiss.StandardGpuResources()
         self.index = faiss.IndexFlatL2(self.data.shape[1])
-        # self.index.add(self.data)
         self.gpu_index = faiss.index_cpu_to_gpu(self.res, gpu_id, self.index)
         self.gpu_index.add(self.data)
 
     def search(self, query: np.ndarray, n_neighbors: int):
         query = query.astype(np.float32)
         distances, indices = self.gpu_index.search(query, n_neighbors + 1)  # +1 to exclude self
-        # distances, indices = self.index.search(query, n_neighbors + 1)  # +1 to exclude self
         return distances[:, 1:], indices[:, 1:]  # Exclude the first neighbor (self)
 
     def local_density(self, query_data: np.ndarray, n_neighbors=10, regularization=1e-9, power=1):
@@ -71,20 +67,6 @@ def load_dir_data(json_dir: str, desc: str = "Loading data") -> np.ndarray:
         
     return np.concatenate(data_list)
 
-def load_dir_text_data(json_dir: str, desc: str = "Loading data") -> np.ndarray:
-    files = sorted(pathlib.Path(json_dir).glob("*.json"), key=lambda x: int(x.stem))
-    data_list = []
-    
-    for file in tqdm(files, desc=desc):
-        data = json.load(open(file,'r', encoding='utf-8'))  # 加载单个 JSON 文件的数据
-        data_list.extend(data)
-    
-    if not data_list:
-        print(f"Warning: No JSON files found in {json_dir}")
-        return []
-        
-    return data_list
-
 def get_files_paths(directory):
     if not os.path.isdir(directory):
         print(f"Error: {directory} is not a valid directory.")
@@ -95,26 +77,3 @@ def get_files_paths(directory):
         key=lambda x: int(x.stem)
     )
     return [str(file) for file in files]
-
-def read_feature(read_dir:str):
-    db_path = os.path.join(read_dir)
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    dataset = read_dir.split('/')[-1].replace('.db','')
-    cursor.execute(f"SELECT * FROM {dataset}")
-    rows = cursor.fetchall()
-    print(len(rows))
-    features = {}
-    for i, row in enumerate(rows):
-        document = row[1]
-        start_index = row[2]
-        embedding = pk.loads(row[3])
-        ln_probability = row[4]
-        features[i] = {
-            'document': document,
-            'start_index': start_index,
-            'embedding': embedding,
-            'ln_probability': ln_probability
-        }
-    conn.close()
-    return features

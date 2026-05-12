@@ -43,19 +43,17 @@ def save_results(selected_data, indices, output_text_dir: str, k: int, density_p
 
 def novelselect(embeddings, k: int, gpu_id: int = 0, neighbors: int = 10,
                   density_power: float = 0.5, distance_power: float = 1.0, 
-                  batch_size: int = 1, seed: int = None):
+                  batch_size: int = 10000, seed: int = None):
     set_seed(seed)
     device = set_device(gpu_id)
     n_samples = embeddings.shape[0]
-    # embeddings = np.linalg.norm(embeddings, axis=1)
     
     with torch.cuda.amp.autocast():
         embeddings_tensor = torch.tensor(embeddings, device=device)
         embeddings_tensor = torch.nn.functional.normalize(embeddings_tensor, p=2, dim=1) # normalize
         embeddings_tensor = embeddings_tensor.half() # for memory efficiency
-        # embeddings_tensor = embeddings_tensor.float()
         
-        faiss_index = FaissIndex(embeddings, (gpu_id+1) % torch.cuda.device_count())
+        faiss_index = FaissIndex(embeddings, gpu_id)
         density_map = torch.tensor(
             faiss_index.local_density(
                 embeddings, 
@@ -65,7 +63,7 @@ def novelselect(embeddings, k: int, gpu_id: int = 0, neighbors: int = 10,
             device=device,
             dtype=torch.float16
         )
-    print("Density map stats:", density_map.min().item(), density_map.max().item(), density_map.std().item())
+    
     centers = [np.random.randint(0, n_samples)] # first point is random
     selected_embeddings = embeddings_tensor[centers]
     
@@ -94,10 +92,6 @@ def novelselect(embeddings, k: int, gpu_id: int = 0, neighbors: int = 10,
                 max_idx = distances.argmax()
                 centers.append(max_idx.item())
                 selected_embeddings = embeddings_tensor[centers]
-                max_val = distances.max().item()
-                num_max = (distances == max_val).sum().item()
-                if i < 10:
-                    print(f"Step {i}: max_dist = {max_val:.6f}, num_ties = {num_max}, selected = {max_idx}")
             
             if i % 10 == 0:
                 torch.cuda.empty_cache()
@@ -108,36 +102,42 @@ def main():
     parser = argparse.ArgumentParser(
         description="Diversity-aware K-Center Greedy sample selection"
     )
+
     parser.add_argument("--text_dir", type=str, required=True,
                        help="Directory containing text data")
-    # parser.add_argument("--figure_dir", type=str, required=True,
-    #                    help="Base directory for embedding figures")
+    
+    parser.add_argument("--figure_dir", type=str, required=True,
+                       help="Base directory for embedding figures")
+    
     parser.add_argument("--output_dir", type=str, required=True,
                        help="Base directory for output")
+    
     parser.add_argument("--k", type=int, default=10000,
                        help="Number of samples to select")
+    
     parser.add_argument("--neighbors", type=int, default=10,
                         help="Number of neighbors for density calculation")
+    
     parser.add_argument("--density_power", type=float, default=0.5,
                        help="Power parameter for density calculation")
+    
     parser.add_argument("--distance_power", type=float, default=1.0,
                        help="Power parameter for distance weighting")
+    
     parser.add_argument("--gpu_id", type=int, default=0,
                        help="GPU ID to use (0-indexed)")
+    
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for reproducibility")
-    parser.add_argument("--batch_size", type=int, default=8192,
-                       help="Batch size for computing distances")
+    
     args = parser.parse_args()
+    
     set_seed(args.seed)
 
+    print(f"Loading embeddings from {args.figure_dir}")
+    embeddings = load_dir_data(args.figure_dir)
     print(f"Loading text data from {args.text_dir}")
-    text = load_dir_text_data(args.text_dir)
-    # print(f"Loading embeddings from {args.figure_dir}")
-    # embeddings = load_dir_data(args.figure_dir)
-    features = read_feature('../../output/feature/SFT.db')
-    embeddings = [features[i]['embedding'] for i in range(len(features))]
-    embeddings = np.array(embeddings)
+    text = load_dir_data(args.text_dir)
     print(f"Loaded embeddings: {embeddings.shape}, text: {len(text)} items")
     
     assert len(embeddings) == len(text), "Embeddings and text counts don't match!"
@@ -150,12 +150,10 @@ def main():
         neighbors=args.neighbors,
         density_power=args.density_power,
         distance_power=args.distance_power,
-        seed=args.seed,
-        batch_size=args.batch_size
+        seed=args.seed
     )
     
-    # selected_text = text[centers_indices].tolist()
-    selected_text = [text[i] for i in centers_indices]
+    selected_text = text[centers_indices].tolist()
     save_results(
         selected_text, centers_indices, args.output_dir, args.k, args.density_power, args.distance_power
     )
@@ -163,5 +161,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# start 12-20 18:35
-# CUDA_VISIBLE_DEVICES=0 python novelselect.py --text_dir ../../data/novel/SFT_text.json --output_dir SFT_novel_10000
