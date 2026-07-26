@@ -2,7 +2,6 @@ import json
 import os
 import csv
 import re
-import gc
 import sqlite3
 import pickle
 import string
@@ -125,7 +124,6 @@ def read_feature(read_dir:str):
 
 
 def feature_const(dataset:str, generator_name:str, embedder_name:str):
-    import torch
     from extractor import Extractor
     data_list = load_json(f'../data/{dataset}.json')
     print('Data length: ', len(data_list))
@@ -153,11 +151,7 @@ def feature_const(dataset:str, generator_name:str, embedder_name:str):
             'embedding': emb,
             'ln_probability': ln_prob
         }
-    del extractor.gen_model
-    del extractor.emb_model
     del extractor
-    gc.collect()
-    torch.cuda.empty_cache()
     sql_conn = sqlite3.connect(f'../output/feature/{dataset}.db')
     dataset_db = dataset.replace('-','_')
     sql_cursor = sql_conn.cursor()

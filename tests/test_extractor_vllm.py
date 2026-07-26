@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +8,7 @@ import numpy as np
 
 from src.extractor import (
     VLLMEmbeddingExtractor,
+    VLLMEmbeddingOfflineExtractor,
     VLLMGenerationProbabilityExtractor,
     VLLMGenerationProbabilityAPIExtractor,
 )
@@ -39,6 +42,11 @@ class _GenerationOutput:
     ]
 
 
+class _PoolingOutput:
+    def __init__(self, embedding):
+        self.outputs = types.SimpleNamespace(embedding=embedding)
+
+
 class VLLMEmbeddingExtractorTest(unittest.TestCase):
     def test_batches_requests_and_restores_response_order(self):
         responses = [
@@ -57,6 +65,8 @@ class VLLMEmbeddingExtractorTest(unittest.TestCase):
                 base_url="http://localhost:8000/v1",
                 model="test-embedder",
                 batch_size=2,
+                max_len=4096,
+                max_workers=1,
             )
             embeddings = extractor.get_embeddings(
                 ["first", "second", "third"],
@@ -67,10 +77,46 @@ class VLLMEmbeddingExtractorTest(unittest.TestCase):
         first_payload = json.loads(urlopen.call_args_list[0].args[0].data)
         self.assertEqual(first_payload["model"], "test-embedder")
         self.assertEqual(first_payload["input"], ["first", "second"])
+        self.assertEqual(first_payload["truncate_prompt_tokens"], 4096)
+        self.assertEqual(first_payload["truncation_side"], "right")
         self.assertEqual(embeddings.shape, (3, 2))
         self.assertTrue(np.allclose(np.linalg.norm(embeddings, axis=1), 1.0))
         self.assertTrue(np.allclose(embeddings[0], [1.0, 0.0]))
         self.assertTrue(np.allclose(embeddings[1], [0.0, 1.0]))
+
+    def test_offline_embedding_uses_vllm_python_api(self):
+        class FakeLLM:
+            init_kwargs = None
+
+            def __init__(self, **kwargs):
+                FakeLLM.init_kwargs = kwargs
+
+            def embed(self, texts):
+                return [_PoolingOutput([3.0, 4.0]) for _ in texts]
+
+        fake_vllm = types.ModuleType("vllm")
+        fake_vllm.LLM = FakeLLM
+        fake_config = types.ModuleType("vllm.config")
+        fake_config.PoolerConfig = lambda **kwargs: kwargs
+
+        with patch.dict(
+            sys.modules,
+            {"vllm": fake_vllm, "vllm.config": fake_config},
+        ):
+            extractor = VLLMEmbeddingOfflineExtractor(
+                model="test-embedder",
+                batch_size=2,
+            )
+            embeddings = extractor.get_embeddings(
+                ["first", "second", "third"],
+                show_progress=False,
+            )
+
+        self.assertEqual(FakeLLM.init_kwargs["runner"], "pooling")
+        self.assertEqual(FakeLLM.init_kwargs["convert"], "embed")
+        self.assertEqual(FakeLLM.init_kwargs["pooler_config"], {"pooling_type": "MEAN"})
+        self.assertEqual(embeddings.shape, (3, 2))
+        self.assertTrue(np.allclose(embeddings, [[0.6, 0.8]] * 3))
 
     def test_generation_probability_matches_shifted_token_mean(self):
         score = VLLMGenerationProbabilityExtractor._mean_prompt_logprob(
@@ -101,6 +147,7 @@ class VLLMEmbeddingExtractorTest(unittest.TestCase):
                 base_url="http://localhost:8001/v1",
                 model="test-generator",
                 batch_size=2,
+                max_len=4096,
             )
             scores = extractor.get_log_probabilities(
                 ["hello"],
@@ -112,6 +159,7 @@ class VLLMEmbeddingExtractorTest(unittest.TestCase):
         self.assertEqual(payload["model"], "test-generator")
         self.assertEqual(payload["prompt"], ["hello"])
         self.assertEqual(payload["prompt_logprobs"], 1)
+        self.assertEqual(payload["truncate_prompt_tokens"], 4095)
         self.assertTrue(np.allclose(scores, [-2.0]))
 
 

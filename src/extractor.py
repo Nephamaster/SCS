@@ -2,8 +2,9 @@ import argparse
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -11,89 +12,65 @@ import numpy as np
 from tqdm.auto import tqdm
 
 
-class Extractor:
-    def __init__(self, generator:str="meta-llama/Llama-3.1-8B", embedder:str="meta-llama/Llama-3.1-8B"):
-        import torch
-        import torch.nn.functional as F
-        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
+def _post_json(
+    request: Request,
+    *,
+    label: str,
+    timeout: float,
+    max_retries: int,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            with urlopen(request, timeout=timeout) as handle:
+                response = json.loads(handle.read().decode("utf-8"))
+            if "error" in response:
+                raise RuntimeError(f"vLLM {label} error: {response['error']}")
+            return response
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            message = f"vLLM {label} HTTP {exc.code}: {body[:1000]}"
+            if exc.code < 500 and exc.code not in {408, 429}:
+                raise RuntimeError(message) from exc
+            last_error = RuntimeError(message)
+        except (URLError, TimeoutError, OSError) as exc:
+            last_error = exc
 
-        self._torch = torch
-        self._F = F
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        tokenizer = AutoTokenizer.from_pretrained(generator, trust_remote_code=True)
-        if 'llama' in generator.lower():
-            tokenizer.pad_token = tokenizer.eos_token
-        self.gen_tokenizer = tokenizer
-        self.gen_model = AutoModelForCausalLM.from_pretrained(
-            generator, device_map="auto", dtype=torch.float16, trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained(embedder, trust_remote_code=True)
-        if 'llama' in embedder.lower():
-            tokenizer.pad_token = tokenizer.eos_token
-        self.emb_tokenizer = tokenizer
-        self.emb_model = AutoModel.from_pretrained(
-            embedder, device_map="auto", dtype=torch.float16, trust_remote_code=True)
-        self.emb_model.eval()
+        if attempt < max_retries:
+            time.sleep(min(2**attempt, 30))
 
-    def cal_gen_prob(self, sentence:str, max_len:int=4096) -> float:
-        """计算输入文本的生成概率"""
-        torch = self._torch
-        F = self._F
-        self.gen_tokenizer.padding_side = "right"
-        inputs = self.gen_tokenizer(
-            sentence, 
-            padding=True, 
-            truncation=True,
-            max_length = max_len, 
-            return_tensors='pt'
-        ).to(self.device)
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-        labels = input_ids.clone()
-        with torch.inference_mode():
-            outputs = self.gen_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits # [1, seq_len, vocab_size]
-        torch.cuda.empty_cache()
-        shift_logits = logits[:, :-1, :]  # [1, seq_len-1, vocab_size]
-        shift_labels = labels[:, 1:]      # [1, seq_len-1]
-        # print('output length: ', outputs.logits.size(1))
-        log_softmax = F.log_softmax(shift_logits, dim=-1)
-        log_likes = log_softmax.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)  # [1, seq_len-1]
-        log_likes_norm = log_likes.mean().item()
-        return log_likes_norm
-    
-    def get_embedding(self, sentence:str, max_len:int=256) -> np.ndarray:
-        """获取输入文本的语义向量"""
-        torch = self._torch
-        encoded_input = self.emb_tokenizer(
-            [sentence],
-            padding=True,
-            truncation=True,
-            max_length=max_len,
-            return_tensors='pt',
-            return_attention_mask=True
-        ).to(self.device)
-        
-        with torch.inference_mode():
-            model_output = self.emb_model(**encoded_input)
-            hidden_states = model_output.last_hidden_state  # [1, seq_len, hidden_size]
-            attention_mask = encoded_input['attention_mask']
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-            sum_embeddings = torch.sum(hidden_states * input_mask_expanded, 1)
-            sum_mask = input_mask_expanded.sum(1)
-            sum_mask = torch.clamp(sum_mask, min=1e-9)  # 防止除零
-            sentence_embeddings = sum_embeddings / sum_mask
-            sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
-        
-        torch.cuda.empty_cache()
-        return sentence_embeddings.cpu().numpy()[0]
+    raise RuntimeError(
+        f"vLLM {label} request failed after {max_retries + 1} attempts"
+    ) from last_error
+
+
+def _as_embedding_matrix(
+    vectors: Sequence[Sequence[float]],
+    expected_rows: int,
+    normalize: bool,
+) -> np.ndarray:
+    matrix = np.asarray(vectors, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[0] != expected_rows:
+        raise RuntimeError(f"Invalid embedding matrix shape: {matrix.shape}")
+    if not np.isfinite(matrix).all():
+        raise RuntimeError("vLLM returned a non-finite embedding")
+    if normalize:
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        matrix = matrix / np.clip(norms, 1e-12, None)
+    return matrix
+
+
+def _endpoint(base_url: str, path: str) -> str:
+    base_url = base_url.rstrip("/")
+    if base_url.endswith(path):
+        return base_url
+    if base_url.endswith("/v1"):
+        return base_url + path
+    return base_url + "/v1" + path
 
 
 class VLLMEmbeddingExtractor:
-    """Batch client for a vLLM OpenAI-compatible embeddings endpoint.
-
-    This client only requests embeddings. It does not perform token counting,
-    truncation, generation-probability calculation, or local model loading.
-    """
+    """Embedding client for vLLM's OpenAI-compatible API."""
 
     def __init__(
         self,
@@ -104,6 +81,8 @@ class VLLMEmbeddingExtractor:
         timeout: float = 600.0,
         max_retries: int = 5,
         normalize: bool = True,
+        max_len: int = 1024,
+        max_workers: int = 4,
     ):
         if not model:
             raise ValueError("vLLM embedding model name is required")
@@ -113,89 +92,60 @@ class VLLMEmbeddingExtractor:
             raise ValueError("timeout must be positive")
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative")
+        if max_len <= 0:
+            raise ValueError("max_len must be positive")
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
 
-        base_url = base_url.rstrip("/")
-        if base_url.endswith("/embeddings"):
-            self.endpoint = base_url
-        elif base_url.endswith("/v1"):
-            self.endpoint = base_url + "/embeddings"
-        else:
-            self.endpoint = base_url + "/v1/embeddings"
+        self.endpoint = _endpoint(base_url, "/embeddings")
         self.model = model
         self.api_key = api_key
         self.batch_size = batch_size
         self.timeout = timeout
         self.max_retries = max_retries
         self.normalize = normalize
+        self.max_len = max_len
+        self.max_workers = max_workers
 
     def _post_batch(self, sentences: Sequence[str]) -> np.ndarray:
         payload = {
             "model": self.model,
             "input": list(sentences),
             "encoding_format": "float",
+            "truncate_prompt_tokens": self.max_len,
+            "truncation_side": "right",
         }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-
         request = Request(
             self.endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=headers,
             method="POST",
         )
-        response = None
-        last_error = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                with urlopen(request, timeout=self.timeout) as handle:
-                    response = json.loads(handle.read().decode("utf-8"))
-                break
-            except HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                message = f"vLLM embeddings HTTP {exc.code}: {body[:1000]}"
-                if exc.code < 500 and exc.code not in {408, 429}:
-                    raise RuntimeError(message) from exc
-                last_error = RuntimeError(message)
-            except (URLError, TimeoutError, OSError) as exc:
-                last_error = exc
-
-            if attempt < self.max_retries:
-                time.sleep(min(2 ** attempt, 30))
-
-        if response is None:
-            raise RuntimeError(
-                f"vLLM embeddings request failed after {self.max_retries + 1} attempts"
-            ) from last_error
-        if "error" in response:
-            raise RuntimeError(f"vLLM embeddings error: {response['error']}")
-
+        response = _post_json(
+            request,
+            label="embeddings",
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+        )
         data = response.get("data")
         if not isinstance(data, list) or len(data) != len(sentences):
             raise RuntimeError(
                 "vLLM embeddings response length does not match request: "
-                f"requested={len(sentences)}, returned={len(data) if isinstance(data, list) else 'invalid'}"
+                f"requested={len(sentences)}, "
+                f"returned={len(data) if isinstance(data, list) else 'invalid'}"
             )
-
-        indexed = sorted(
+        ordered = sorted(
             enumerate(data),
             key=lambda item: int(item[1].get("index", item[0])),
         )
-        vectors = np.asarray(
-            [item[1]["embedding"] for item in indexed],
-            dtype=np.float32,
+        return _as_embedding_matrix(
+            [item[1]["embedding"] for item in ordered],
+            len(sentences),
+            self.normalize,
         )
-        if vectors.ndim != 2 or vectors.shape[0] != len(sentences):
-            raise RuntimeError(f"Invalid embedding matrix shape: {vectors.shape}")
-        if not np.isfinite(vectors).all():
-            raise RuntimeError("vLLM returned a non-finite embedding")
-        if self.normalize:
-            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-            vectors = vectors / np.clip(norms, 1e-12, None)
-        return vectors
 
     def get_embeddings(
         self,
@@ -204,8 +154,6 @@ class VLLMEmbeddingExtractor:
         batch_size: int | None = None,
         show_progress: bool = True,
     ) -> np.ndarray:
-        """Return embeddings in exactly the same order as ``sentences``."""
-
         texts = list(sentences)
         if not texts:
             return np.empty((0, 0), dtype=np.float32)
@@ -213,25 +161,21 @@ class VLLMEmbeddingExtractor:
         if size <= 0:
             raise ValueError("batch_size must be positive")
 
+        batches = [texts[start : start + size] for start in range(0, len(texts), size)]
         vectors = []
-        progress = tqdm(
+        with tqdm(
             total=len(texts),
-            desc="vLLM embeddings",
+            desc="vLLM API embeddings",
             unit="row",
             disable=not show_progress,
-        )
-        try:
-            for start in range(0, len(texts), size):
-                batch = texts[start : start + size]
-                vectors.append(self._post_batch(batch))
-                progress.update(len(batch))
-        finally:
-            progress.close()
+        ) as progress:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                for batch, vector in zip(batches, executor.map(self._post_batch, batches)):
+                    vectors.append(vector)
+                    progress.update(len(batch))
         return np.concatenate(vectors, axis=0)
 
     def get_embedding(self, sentence: str) -> np.ndarray:
-        """Compatibility wrapper matching the local ``Extractor`` API."""
-
         return self.get_embeddings([sentence], show_progress=False)[0]
 
     def embed_jsonl(
@@ -242,64 +186,119 @@ class VLLMEmbeddingExtractor:
         text_key: str = "doc",
         id_key: str = "sample_id",
     ) -> None:
-        """Embed a candidate-doc JSONL and save IDs plus vectors as ``.npz``."""
-
-        records = []
-        with Path(input_path).open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise ValueError(f"{input_path}:{line_number} is not an object")
-                if not isinstance(record.get(id_key), str):
-                    raise ValueError(f"{input_path}:{line_number} has no string {id_key!r}")
-                if not isinstance(record.get(text_key), str):
-                    raise ValueError(f"{input_path}:{line_number} has no string {text_key!r}")
-                records.append(record)
-
-        ids = [record[id_key] for record in records]
-        texts = [record[text_key] for record in records]
-        embeddings = self.get_embeddings(texts)
+        records = _read_jsonl(input_path, text_key=text_key, id_key=id_key)
+        embeddings = self.get_embeddings([record[text_key] for record in records])
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             output,
-            sample_ids=np.asarray(ids, dtype=np.str_),
+            sample_ids=np.asarray([record[id_key] for record in records], dtype=np.str_),
             embeddings=embeddings,
         )
 
 
-class VLLMGenerationProbabilityExtractor:
-    """Batch generation-probability extractor using vLLM's offline API.
-
-    ``prompt_logprobs`` contains the model log probability assigned to each
-    input token.  The first input token has no preceding context, so it is
-    excluded from the mean, matching :meth:`Extractor.cal_gen_prob`.
-    """
+class VLLMEmbeddingOfflineExtractor:
+    """Embedding extractor using vLLM's Python offline API."""
 
     def __init__(
         self,
         model: str,
         *,
-        max_len: int = 4096,
+        max_len: int = 1024,
+        batch_size: int = 64,
+        dtype: str = "float16",
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        pooling_type: str = "MEAN",
+        trust_remote_code: bool = False,
+    ):
+        _validate_model_args(model, max_len, batch_size, tensor_parallel_size, gpu_memory_utilization)
+        try:
+            from vllm import LLM
+            from vllm.config import PoolerConfig
+        except ImportError as exc:
+            raise ImportError(
+                "VLLMEmbeddingOfflineExtractor requires the vllm package"
+            ) from exc
+
+        self.batch_size = batch_size
+        self.normalize = True
+        self.llm = LLM(
+            model=model,
+            runner="pooling",
+            convert="embed",
+            max_model_len=max_len,
+            dtype=dtype,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            pooler_config=PoolerConfig(pooling_type=pooling_type),
+            trust_remote_code=trust_remote_code,
+        )
+
+    def get_embeddings(
+        self,
+        sentences: Sequence[str],
+        *,
+        batch_size: int | None = None,
+        show_progress: bool = True,
+    ) -> np.ndarray:
+        texts = list(sentences)
+        if not texts:
+            return np.empty((0, 0), dtype=np.float32)
+        size = batch_size or self.batch_size
+        if size <= 0:
+            raise ValueError("batch_size must be positive")
+
+        vectors = []
+        with tqdm(
+            total=len(texts),
+            desc="vLLM offline embeddings",
+            unit="row",
+            disable=not show_progress,
+        ) as progress:
+            for start in range(0, len(texts), size):
+                outputs = self.llm.embed(texts[start : start + size])
+                vectors.extend(output.outputs.embedding for output in outputs)
+                progress.update(len(outputs))
+        return _as_embedding_matrix(vectors, len(texts), self.normalize)
+
+    def get_embedding(self, sentence: str) -> np.ndarray:
+        return self.get_embeddings([sentence], show_progress=False)[0]
+
+    def embed_jsonl(
+        self,
+        input_path: str | Path,
+        output_path: str | Path,
+        *,
+        text_key: str = "doc",
+        id_key: str = "sample_id",
+    ) -> None:
+        records = _read_jsonl(input_path, text_key=text_key, id_key=id_key)
+        embeddings = self.get_embeddings([record[text_key] for record in records])
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            output,
+            sample_ids=np.asarray([record[id_key] for record in records], dtype=np.str_),
+            embeddings=embeddings,
+        )
+
+
+class VLLMGenerationProbabilityExtractor:
+    """Generation-probability extractor using vLLM's Python offline API."""
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        max_len: int = 1024,
         batch_size: int = 8,
         dtype: str = "float16",
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         trust_remote_code: bool = False,
     ):
-        if not model:
-            raise ValueError("vLLM generation model name is required")
-        if max_len <= 1:
-            raise ValueError("max_len must be greater than 1")
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if tensor_parallel_size <= 0:
-            raise ValueError("tensor_parallel_size must be positive")
-        if not 0 < gpu_memory_utilization <= 1:
-            raise ValueError("gpu_memory_utilization must be in (0, 1]")
-
+        _validate_model_args(model, max_len, batch_size, tensor_parallel_size, gpu_memory_utilization)
         try:
             from vllm import LLM, SamplingParams
         except ImportError as exc:
@@ -311,32 +310,18 @@ class VLLMGenerationProbabilityExtractor:
         self.batch_size = batch_size
         self.llm = LLM(
             model=model,
-            dtype=dtype,
+            runner="generate",
             max_model_len=max_len,
+            dtype=dtype,
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             trust_remote_code=trust_remote_code,
         )
-        self.tokenizer = self.llm.get_tokenizer()
         self.sampling_params = SamplingParams(
             temperature=0.0,
             max_tokens=1,
             prompt_logprobs=1,
         )
-
-    def _tokenize(self, sentence: str) -> list[int]:
-        encoded = self.tokenizer(
-            sentence,
-            truncation=True,
-            max_length=self.max_len,
-            add_special_tokens=True,
-        )
-        token_ids = encoded["input_ids"]
-        if len(token_ids) <= 1:
-            raise ValueError(
-                "Generation probability requires at least two input tokens"
-            )
-        return token_ids
 
     @staticmethod
     def _mean_prompt_logprob_from_parts(token_ids, prompt_logprobs) -> float:
@@ -385,8 +370,6 @@ class VLLMGenerationProbabilityExtractor:
         batch_size: int | None = None,
         show_progress: bool = True,
     ) -> np.ndarray:
-        """Return mean input-token log probabilities in input order."""
-
         texts = list(sentences)
         if not texts:
             return np.empty((0,), dtype=np.float32)
@@ -395,21 +378,16 @@ class VLLMGenerationProbabilityExtractor:
             raise ValueError("batch_size must be positive")
 
         scores = []
-        progress = tqdm(
+        with tqdm(
             total=len(texts),
-            desc="vLLM generation probabilities",
+            desc="vLLM offline generation probabilities",
             unit="row",
             disable=not show_progress,
-        )
-        try:
+        ) as progress:
             for start in range(0, len(texts), size):
                 batch = texts[start : start + size]
-                prompts = [
-                    {"prompt_token_ids": self._tokenize(sentence)}
-                    for sentence in batch
-                ]
                 outputs = self.llm.generate(
-                    prompts,
+                    batch,
                     self.sampling_params,
                     use_tqdm=False,
                 )
@@ -420,13 +398,9 @@ class VLLMGenerationProbabilityExtractor:
                     )
                 scores.extend(self._mean_prompt_logprob(output) for output in outputs)
                 progress.update(len(batch))
-        finally:
-            progress.close()
         return np.asarray(scores, dtype=np.float32)
 
     def cal_gen_prob(self, sentence: str) -> float:
-        """Compatibility wrapper matching :meth:`Extractor.cal_gen_prob`."""
-
         return float(self.get_log_probabilities([sentence], show_progress=False)[0])
 
     def score_jsonl(
@@ -437,72 +411,22 @@ class VLLMGenerationProbabilityExtractor:
         text_key: str = "doc",
         id_key: str = "sample_id",
     ) -> None:
-        """Score a candidate-doc JSONL and save IDs plus log probabilities."""
-
-        sample_ids = []
-        scores = []
-        batch_ids = []
-        batch_texts = []
-        progress = tqdm(desc="Read and score generation probabilities", unit="row")
-
-        def flush_batch() -> None:
-            if not batch_texts:
-                return
-            batch_scores = self.get_log_probabilities(
-                batch_texts,
-                show_progress=False,
-            )
-            sample_ids.extend(batch_ids)
-            scores.extend(batch_scores.tolist())
-            batch_ids.clear()
-            batch_texts.clear()
-
-        try:
-            with Path(input_path).open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
-                    if not line.strip():
-                        continue
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError(f"{input_path}:{line_number} is not an object")
-                    if not isinstance(record.get(id_key), str):
-                        raise ValueError(
-                            f"{input_path}:{line_number} has no string {id_key!r}"
-                        )
-                    if not isinstance(record.get(text_key), str):
-                        raise ValueError(
-                            f"{input_path}:{line_number} has no string {text_key!r}"
-                        )
-                    batch_ids.append(record[id_key])
-                    batch_texts.append(record[text_key])
-                    progress.update(1)
-                    if len(batch_texts) >= self.batch_size:
-                        flush_batch()
-            flush_batch()
-        finally:
-            progress.close()
-
-        output = Path(output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            output,
-            sample_ids=np.asarray(sample_ids, dtype=np.str_),
-            ln_probability=np.asarray(scores, dtype=np.float32),
-        )
+        _score_jsonl(self, input_path, output_path, text_key=text_key, id_key=id_key)
 
 
 class VLLMGenerationProbabilityAPIExtractor:
-    """Batch generation-probability client for vLLM's completion API."""
+    """Generation-probability client for vLLM's completions API."""
 
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8000/v1",
         model: str | None = None,
         api_key: str | None = None,
-        max_len: int = 4096,
+        max_len: int = 1024,
         batch_size: int = 8,
         timeout: float = 600.0,
         max_retries: int = 5,
+        max_workers: int = 4,
     ):
         if not model:
             raise ValueError("vLLM generation model name is required")
@@ -514,20 +438,17 @@ class VLLMGenerationProbabilityAPIExtractor:
             raise ValueError("timeout must be positive")
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative")
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
 
-        base_url = base_url.rstrip("/")
-        if base_url.endswith("/completions"):
-            self.endpoint = base_url
-        elif base_url.endswith("/v1"):
-            self.endpoint = base_url + "/completions"
-        else:
-            self.endpoint = base_url + "/v1/completions"
+        self.endpoint = _endpoint(base_url, "/completions")
         self.model = model
         self.api_key = api_key
         self.max_len = max_len
         self.batch_size = batch_size
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_workers = max_workers
 
     def _post_batch(self, sentences: Sequence[str]) -> np.ndarray:
         payload = {
@@ -537,63 +458,38 @@ class VLLMGenerationProbabilityAPIExtractor:
             "temperature": 0.0,
             "prompt_logprobs": 1,
             "return_token_ids": True,
-            "truncate_prompt_tokens": self.max_len,
-            "truncation_side": "right",
-            "add_special_tokens": True,
+            "truncate_prompt_tokens": self.max_len - 1,
             "stream": False,
         }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-
         request = Request(
             self.endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=headers,
             method="POST",
         )
-        response = None
-        last_error = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                with urlopen(request, timeout=self.timeout) as handle:
-                    response = json.loads(handle.read().decode("utf-8"))
-                break
-            except HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                message = f"vLLM completion HTTP {exc.code}: {body[:1000]}"
-                if exc.code < 500 and exc.code not in {408, 429}:
-                    raise RuntimeError(message) from exc
-                last_error = RuntimeError(message)
-            except (URLError, TimeoutError, OSError) as exc:
-                last_error = exc
-
-            if attempt < self.max_retries:
-                time.sleep(min(2 ** attempt, 30))
-
-        if response is None:
-            raise RuntimeError(
-                f"vLLM completion request failed after {self.max_retries + 1} attempts"
-            ) from last_error
-        if "error" in response:
-            raise RuntimeError(f"vLLM completion error: {response['error']}")
-
+        response = _post_json(
+            request,
+            label="completion",
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+        )
         choices = response.get("choices")
         if not isinstance(choices, list) or len(choices) != len(sentences):
             raise RuntimeError(
                 "vLLM completion response length does not match request: "
-                f"requested={len(sentences)}, returned={len(choices) if isinstance(choices, list) else 'invalid'}"
+                f"requested={len(sentences)}, "
+                f"returned={len(choices) if isinstance(choices, list) else 'invalid'}"
             )
 
-        indexed = sorted(
+        ordered = sorted(
             enumerate(choices),
             key=lambda item: int(item[1].get("index", item[0])),
         )
         scores = []
-        for _, choice in indexed:
+        for _, choice in ordered:
             token_ids = choice.get("prompt_token_ids")
             prompt_logprobs = choice.get("prompt_logprobs")
             if token_ids is None or prompt_logprobs is None:
@@ -623,20 +519,21 @@ class VLLMGenerationProbabilityAPIExtractor:
         if size <= 0:
             raise ValueError("batch_size must be positive")
 
+        batches = [texts[start : start + size] for start in range(0, len(texts), size)]
         scores = []
-        progress = tqdm(
+        with tqdm(
             total=len(texts),
             desc="vLLM API generation probabilities",
             unit="row",
             disable=not show_progress,
-        )
-        try:
-            for start in range(0, len(texts), size):
-                batch = texts[start : start + size]
-                scores.append(self._post_batch(batch))
-                progress.update(len(batch))
-        finally:
-            progress.close()
+        ) as progress:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                for batch, batch_scores in zip(
+                    batches,
+                    executor.map(self._post_batch, batches),
+                ):
+                    scores.append(batch_scores)
+                    progress.update(len(batch))
         return np.concatenate(scores, axis=0)
 
     def score_jsonl(
@@ -647,68 +544,141 @@ class VLLMGenerationProbabilityAPIExtractor:
         text_key: str = "doc",
         id_key: str = "sample_id",
     ) -> None:
-        sample_ids = []
-        scores = []
-        batch_ids = []
-        batch_texts = []
-        progress = tqdm(desc="Read and score generation probabilities", unit="row")
+        _score_jsonl(self, input_path, output_path, text_key=text_key, id_key=id_key)
 
-        def flush_batch() -> None:
-            if not batch_texts:
-                return
-            batch_scores = self.get_log_probabilities(
-                batch_texts,
-                show_progress=False,
-            )
-            sample_ids.extend(batch_ids)
-            scores.extend(batch_scores.tolist())
-            batch_ids.clear()
-            batch_texts.clear()
 
-        try:
-            with Path(input_path).open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
-                    if not line.strip():
-                        continue
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError(f"{input_path}:{line_number} is not an object")
-                    if not isinstance(record.get(id_key), str):
-                        raise ValueError(
-                            f"{input_path}:{line_number} has no string {id_key!r}"
-                        )
-                    if not isinstance(record.get(text_key), str):
-                        raise ValueError(
-                            f"{input_path}:{line_number} has no string {text_key!r}"
-                        )
-                    batch_ids.append(record[id_key])
-                    batch_texts.append(record[text_key])
-                    progress.update(1)
-                    if len(batch_texts) >= self.batch_size:
-                        flush_batch()
-            flush_batch()
-        finally:
-            progress.close()
+class Extractor:
+    """Compatibility facade using vLLM's Python interface for both features."""
 
-        output = Path(output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            output,
-            sample_ids=np.asarray(sample_ids, dtype=np.str_),
-            ln_probability=np.asarray(scores, dtype=np.float32),
+    def __init__(
+        self,
+        generator: str = "meta-llama/Llama-3.1-8B",
+        embedder: str = "meta-llama/Llama-3.1-8B",
+        *,
+        max_len: int = 1024,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        dtype: str = "float16",
+        trust_remote_code: bool = False,
+    ):
+        common = {
+            "max_len": max_len,
+            "tensor_parallel_size": tensor_parallel_size,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "dtype": dtype,
+            "trust_remote_code": trust_remote_code,
+        }
+        self._embedder = VLLMEmbeddingOfflineExtractor(model=embedder, **common)
+        self._generator = VLLMGenerationProbabilityExtractor(model=generator, **common)
+
+    def get_embedding(self, sentence: str, max_len: int | None = None) -> np.ndarray:
+        return self._embedder.get_embedding(sentence)
+
+    def cal_gen_prob(self, sentence: str, max_len: int | None = None) -> float:
+        return self._generator.cal_gen_prob(sentence)
+
+
+def _validate_model_args(
+    model: str,
+    max_len: int,
+    batch_size: int,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+) -> None:
+    if not model:
+        raise ValueError("vLLM model name is required")
+    if max_len <= 1:
+        raise ValueError("max_len must be greater than 1")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if tensor_parallel_size <= 0:
+        raise ValueError("tensor_parallel_size must be positive")
+    if not 0 < gpu_memory_utilization <= 1:
+        raise ValueError("gpu_memory_utilization must be in (0, 1]")
+
+
+def _read_jsonl(
+    input_path: str | Path,
+    *,
+    text_key: str,
+    id_key: str,
+) -> list[dict[str, Any]]:
+    records = []
+    with Path(input_path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"{input_path}:{line_number} is not an object")
+            if not isinstance(record.get(id_key), str):
+                raise ValueError(f"{input_path}:{line_number} has no string {id_key!r}")
+            if not isinstance(record.get(text_key), str):
+                raise ValueError(f"{input_path}:{line_number} has no string {text_key!r}")
+            records.append(record)
+    return records
+
+
+def _score_jsonl(
+    extractor,
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    text_key: str,
+    id_key: str,
+) -> None:
+    sample_ids = []
+    scores = []
+    batch_ids = []
+    batch_texts = []
+
+    def flush_batch() -> None:
+        if not batch_texts:
+            return
+        batch_scores = extractor.get_log_probabilities(
+            batch_texts,
+            show_progress=False,
         )
+        sample_ids.extend(batch_ids)
+        scores.extend(batch_scores.tolist())
+        batch_ids.clear()
+        batch_texts.clear()
+
+    with tqdm(desc="Read and score generation probabilities", unit="row") as progress:
+        with Path(input_path).open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError(f"{input_path}:{line_number} is not an object")
+                if not isinstance(record.get(id_key), str):
+                    raise ValueError(f"{input_path}:{line_number} has no string {id_key!r}")
+                if not isinstance(record.get(text_key), str):
+                    raise ValueError(f"{input_path}:{line_number} has no string {text_key!r}")
+                batch_ids.append(record[id_key])
+                batch_texts.append(record[text_key])
+                progress.update(1)
+                if len(batch_texts) >= extractor.batch_size:
+                    flush_batch()
+        flush_batch()
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output,
+        sample_ids=np.asarray(sample_ids, dtype=np.str_),
+        ln_probability=np.asarray(scores, dtype=np.float32),
+    )
 
 
 def _main_vllm() -> None:
     parser = argparse.ArgumentParser(description="Run batch extraction through vLLM.")
     parser.add_argument(
         "--mode",
-        choices=(
-            "embedding",
-            "generation-probability",
-            "generation-probability-api",
-        ),
+        choices=("embedding", "embedding-offline", "generation-probability", "generation-probability-api"),
         default="embedding",
+        help="embedding uses HTTP API; embedding-offline uses vLLM's Python API",
     )
     parser.add_argument("--input-jsonl", required=True, type=Path)
     parser.add_argument("--output-npz", required=True, type=Path)
@@ -726,15 +696,17 @@ def _main_vllm() -> None:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--no-normalize", action="store_true")
-    parser.add_argument("--max-len", type=int, default=4096)
+    parser.add_argument("--max-len", type=int, default=1024)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--pooling-type", default="MEAN")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
 
     if args.mode == "embedding":
-        client = VLLMEmbeddingExtractor(
+        extractor = VLLMEmbeddingExtractor(
             base_url=args.base_url,
             model=args.model,
             api_key=args.api_key,
@@ -742,10 +714,24 @@ def _main_vllm() -> None:
             timeout=args.timeout,
             max_retries=args.max_retries,
             normalize=not args.no_normalize,
+            max_len=args.max_len,
+            max_workers=args.num_workers,
         )
-        client.embed_jsonl(args.input_jsonl, args.output_npz)
+        extractor.embed_jsonl(args.input_jsonl, args.output_npz)
+    elif args.mode == "embedding-offline":
+        extractor = VLLMEmbeddingOfflineExtractor(
+            model=args.model,
+            max_len=args.max_len,
+            batch_size=args.batch_size,
+            dtype=args.dtype,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            pooling_type=args.pooling_type,
+            trust_remote_code=args.trust_remote_code,
+        )
+        extractor.embed_jsonl(args.input_jsonl, args.output_npz)
     elif args.mode == "generation-probability":
-        client = VLLMGenerationProbabilityExtractor(
+        extractor = VLLMGenerationProbabilityExtractor(
             model=args.model,
             max_len=args.max_len,
             batch_size=args.batch_size,
@@ -754,9 +740,9 @@ def _main_vllm() -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
             trust_remote_code=args.trust_remote_code,
         )
-        client.score_jsonl(args.input_jsonl, args.output_npz)
+        extractor.score_jsonl(args.input_jsonl, args.output_npz)
     else:
-        client = VLLMGenerationProbabilityAPIExtractor(
+        extractor = VLLMGenerationProbabilityAPIExtractor(
             base_url=args.base_url,
             model=args.model,
             api_key=args.api_key,
@@ -764,8 +750,9 @@ def _main_vllm() -> None:
             batch_size=args.batch_size,
             timeout=args.timeout,
             max_retries=args.max_retries,
+            max_workers=args.num_workers,
         )
-        client.score_jsonl(args.input_jsonl, args.output_npz)
+        extractor.score_jsonl(args.input_jsonl, args.output_npz)
     print(f"Saved {args.mode} results to {args.output_npz}")
 
 
