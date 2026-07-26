@@ -77,21 +77,50 @@ def cal_chebyshev(a, b):
 
 
 def read_feature(read_dir:str):
-    db_path = os.path.join(read_dir)
+    """Read feature rows written by :func:`feature_const`.
+
+    The feature table schema is ``doc_id, embedding, ln_probability``.  Read
+    the named columns explicitly instead of relying on positional indexes so
+    this remains compatible with SQLite tables that store the same fields in
+    a different order.
+    """
+    db_path = os.path.abspath(os.fspath(read_dir))
+    dataset = os.path.splitext(os.path.basename(db_path))[0].replace('-', '_')
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    dataset = read_dir.split('/')[-1].replace('.db','').replace('-','_')
-    cursor.execute(f"SELECT * FROM {dataset}")
-    rows = cursor.fetchall()
+    try:
+        cursor.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            """,
+            (dataset,),
+        )
+        table_row = cursor.fetchone()
+        if table_row is None:
+            raise ValueError(
+                f"Feature table '{dataset}' not found in database: {db_path}"
+            )
+
+        # The table name comes from sqlite_master, but quote it before using it
+        # in the SELECT statement because SQLite does not parameterize names.
+        table_name = table_row[0].replace('"', '""')
+        cursor.execute(
+            f'SELECT doc_id, embedding, ln_probability FROM "{table_name}" '
+            "ORDER BY doc_id"
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
     features = {}
-    for i, row in enumerate(rows):
-        embedding = pickle.loads(row[3])
-        ln_probability = row[4]
+    for i, (_doc_id, embedding_blob, ln_probability) in enumerate(rows):
         features[i] = {
-            'embedding': embedding,
-            'ln_probability': ln_probability
+            'embedding': pickle.loads(embedding_blob),
+            'ln_probability': ln_probability,
         }
-    conn.close()
     return features
 
 
@@ -105,9 +134,20 @@ def feature_const(dataset:str, generator_name:str, embedder_name:str):
     extractor = Extractor(generator=generator_new_name, embedder=embedder_new_name)
     features = {}
     for sid, term in tqdm(enumerate(data_list), total=len(data_list), ncols=100):
-        emb = extractor.get_embedding(term['doc'])
+        emb = np.asarray(extractor.get_embedding(term['doc']), dtype=np.float32)
+        if emb.ndim != 1 or emb.size == 0:
+            raise ValueError(
+                f'Feature row {sid + 1} produced an invalid embedding shape: '
+                f'{emb.shape}.'
+            )
+        if not np.isfinite(emb).all():
+            raise ValueError(
+                f'Feature row {sid + 1} produced a non-finite embedding. '
+                'The feature database was not written; inspect the embedder '
+                'dtype or the source record before retrying.'
+            )
         ln_prob = extractor.cal_gen_prob(term['doc'])
-        if np.isnan(ln_prob):
+        if not np.isfinite(ln_prob):
             ln_prob = 1e-10
         features[sid] = {
             'embedding': emb,

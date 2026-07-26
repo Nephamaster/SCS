@@ -18,6 +18,11 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+The SCS repository covers data preprocessing, feature extraction, semantic
+clustering, SCS calculation, and optional subset selection. Downstream
+instruction tuning is run separately with your ms-swift training workflow;
+the selected JSON file produced here is the handoff dataset for that stage.
+
 ### 1. Prepare your data
 
 Your instruction-tuning dataset should follow the **ShareGPT format**:
@@ -46,19 +51,21 @@ Your instruction-tuning dataset should follow the **ShareGPT format**:
 
 ### 2. Preprocess the data
 
-From the src/ directory, run:
+Run the command from the `src/` directory because the current implementation
+uses paths relative to that directory:
 
 ```bash
 cd src
-python datastation.py --dataset <DATASET>
+python datastation.py <DATASET>
 ```
 
 ### 3. Compute SCS
 
-Evaluate the Semantic Cohesion State of your dataset:
+Run this while the current working directory is still `src/` (if you start
+from the repository root, run `cd src` first):
 
 ```bash
-python entropy.py --dataset <DATASET> \
+python entropy.py <DATASET> \
                   --generator <GENERATOR_MODEL> \
                   --embedder <EMBEDDER_MODEL>
 ```
@@ -71,20 +78,28 @@ python entropy.py --dataset <DATASET> \
 
 ### 4. Check the result
 
-the clusters of your dataset saved in `output/cluster/<DATASET>.json`
+The outputs are written under the repository root:
 
-the intrinsic generation probabilities and semantic embeddings saved in `output/feature/<DATASET>`
+- processed data: `data/<DATASET>.json`
+- feature database (embedding + log-probability): `output/feature/<DATASET>.db`
+- clusters: `output/cluster/<DATASET>.json`
+- SCS score: `output/result/<DATASET>_SCS_0.json`
+- documents grouped by cluster: `output/result/<DATASET>_doc_0.json`
 
-the SCS score saved in `output/result/<DATASET>_SCS_0.json`
+When the processed data, feature database, or cluster file already exists,
+the corresponding pipeline stage is reused. SCS result files use the first
+available suffix (`_SCS_0`, `_SCS_1`, ...).
 
 ## SCS Data Selection
 
-After preprocessing, feature extraction, and clustering are complete, you can select a
-subset by Semantic Cohesion Weight from the repository root:
+After preprocessing, feature extraction, and clustering are complete, select a
+subset by Semantic Cohesion Weight from the `src/` directory. If you are
+already in `src/`, run only the second command:
 
 ```bash
-python data_selection/scs_select.py <DATASET> \
-                                    --sample_size <SAMPLE_SIZE>
+cd src
+python scs_select.py --dataset <DATASET> \
+                     --sample_size <SAMPLE_SIZE>
 ```
 
 The selector sorts samples inside each semantic cluster by the Semantic Cohesion
@@ -100,6 +115,82 @@ Optional arguments:
 --output <OUTPUT_JSON>
 --metadata_output <METADATA_JSON>
 ```
+
+The selector writes ShareGPT records from `data/raw/<DATASET>.json` by
+default. Use `--source processed` only when the downstream consumer expects
+the flattened records in `data/<DATASET>.json`. The optional metadata file
+contains the selected `doc_id`, semantic cluster id, and cohesion weight.
+
+## K-Means Data Selection
+
+K-Means selection validates the feature database schema and source-record
+count before fitting. The expected database contains a table named after the
+database file (with `-` replaced by `_`) and the columns
+`doc_id`, `embedding`, and `ln_probability`.
+
+To generate multiple independently sampled subsets, run:
+
+```bash
+python data_selection/kmeans_select.py \
+    --input data/All/SFT.json \
+    --feature_db output/feature/qSFT.db \
+    --num_groups 12 \
+    --sample_size 10000 \
+    --n_clusters 50 \
+    --seed 46 \
+    --overwrite
+```
+
+The outputs are written separately to `data/doc/kmeans/` and
+`data/sft/kmeans/`. Each `kmeans_XX.json`/`kmeans_XX.jsonl` pair uses the same
+selected source indices: DOC records have `doc` and `n_tokens`, while each SFT
+JSONL line has ms-swift-compatible `messages`. The run metadata is saved to
+`data/kmeans_manifest.json`. `--num_datasets` and `--num_dataset` are accepted
+as aliases for `--num_groups`. If an existing feature database contains
+non-finite embedding values, the selector repairs them with per-dimension
+means by default and records the repaired-row count in the manifest. Use
+`--invalid_embedding_policy error` to enforce strict rejection, or
+`--invalid_embedding_policy zero` for zero-value replacement.
+
+## Random Data Selection
+
+To create 12 reproducible random groups from the frozen candidate pool:
+
+```bash
+python data_selection/random_select.py \
+    --input data/candidate/v1/candidate_messages.jsonl \
+    --num_groups 12 \
+    --sample_size 10000 \
+    --seed 123 \
+    --overwrite
+```
+
+The default output is only ms-swift JSONL:
+
+- `data/sft/random/random_01.jsonl` through `random_12.jsonl`
+- `data/sft/random/random_manifest.json`
+
+Each selected line contains `candidate_index`, `sample_id`, `source`, and
+ms-swift-compatible `messages`. `candidate_index` is the zero-based row index
+in `data/candidate/v1/candidate_messages.jsonl`; use it to read the same row
+from the full candidate-pool embedding/log-probability arrays. No new DOC file
+or token-count audit is generated for a selected subset.
+
+By default groups are independently sampled without replacement within each
+group. Add `--disjoint` when the 12 groups must not share source records.
+
+## Downstream ms-swift training
+
+The SCS-selected file is a data-selection artifact, not an ms-swift training
+configuration. For random selection, use the files under
+`data/sft/random/` directly as the ms-swift dataset inputs. For SCS selection,
+register or convert `output/selection/<DATASET>_scs_<SAMPLE_SIZE>.json` in the
+ms-swift dataset layout required by your training environment, then launch
+ms-swift SFT with your normal model, template, sequence-length, and
+output-directory settings.
+Keep the prompt/template and maximum-length policy consistent between data
+conversion and ms-swift training so the selected samples are not silently
+reformatted or truncated.
 
 ## Citation
 

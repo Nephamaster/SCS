@@ -2,3 +2,7 @@ hdbscan
 torch
 transformers
 umap-learn
+datasets
+sentencepiece
+py-data-juicer
+tqdm
