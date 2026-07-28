@@ -1,10 +1,14 @@
 import os
-import hdbscan
-from umap import UMAP
-from utils import read_feature, save_json
+try:
+    from .utils import read_feature, save_json
+except ImportError:
+    from utils import read_feature, save_json
 
 
 def cluster_const(dataset:str):
+    import hdbscan
+    from umap import UMAP
+
     dataset_db = dataset.replace('-', '_')
     doc_embed_file = f'../output/feature/{dataset_db}.db'
     if os.path.exists(doc_embed_file):

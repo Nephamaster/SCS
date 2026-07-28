@@ -2,8 +2,10 @@ import os
 import sys
 import argparse
 import numpy as np
-from cluster import cluster_const
-from utils import *
+try:
+    from .utils import *
+except ImportError:
+    from utils import *
 
 
 def cal_class_prob(sem_ids:list[int],
@@ -121,6 +123,11 @@ def get_SCS(dataset:str, data_list:list[str], features:dict, clusters:list[dict]
 def pipeline(dataset:str,
              generator:str='meta-llama/Llama-3.1-8B',
              embedder:str='meta-llama/Llama-3.1-8B'):
+    try:
+        from .cluster import cluster_const
+    except ImportError:
+        from cluster import cluster_const
+
     data_file = f"../data/{dataset}.json"
     feature_file = f"../output/feature/{dataset}.db"
     cluster_file = f"../output/cluster/{dataset}.json"

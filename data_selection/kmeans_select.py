@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import normalize
+from sklearn.cluster import MiniBatchKMeans
 from tqdm.auto import tqdm
 
 
@@ -156,6 +155,40 @@ def build_indices(
     return index_groups, seeds
 
 
+def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
+    """Normalize rows in place to avoid copying the full embedding matrix."""
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    np.divide(embeddings, norms, out=embeddings, where=norms != 0)
+    return embeddings
+
+
+def choose_k_values(
+    k_min: int,
+    k_max: int,
+    groups: int,
+    seed: int,
+) -> list[int]:
+    """Choose one deterministic random K from each evenly spaced interval."""
+    if k_min < 20 or k_max > 100 or k_min > k_max:
+        raise ValueError("k_range must be within 20..100 and min <= max.")
+    if groups <= 0:
+        raise ValueError("groups must be positive.")
+    interval_size = k_max - k_min + 1
+    if groups > interval_size:
+        raise ValueError(
+            "groups cannot exceed the number of integer K values in k_range."
+        )
+
+    rng = random.Random(seed)
+    values = []
+    for group_id in range(groups):
+        start = k_min + interval_size * group_id // groups
+        end = k_min + interval_size * (group_id + 1) // groups - 1
+        values.append(rng.randint(start, end))
+    rng.shuffle(values)
+    return values
+
+
 def pairwise_overlap_counts(index_groups: list[list[int]]) -> list[list[int]]:
     index_sets = [set(indices) for indices in index_groups]
     return [
@@ -223,16 +256,6 @@ def parse_args() -> argparse.Namespace:
         help=f"Output directory (default: {DEFAULT_SFT_OUTPUT_DIR}).",
     )
     parser.add_argument(
-        "--num-groups",
-        "--num_groups",
-        "--num-datasets",
-        "--num_dataset",
-        dest="num_groups",
-        type=int,
-        default=12,
-        help="Number of groups to generate (default: 12).",
-    )
-    parser.add_argument(
         "--sample-size",
         "--sample_size",
         dest="sample_size",
@@ -241,22 +264,53 @@ def parse_args() -> argparse.Namespace:
         help="Number of records in each group (default: 10000).",
     )
     parser.add_argument(
-        "--k",
-        "--n-clusters",
-        "--n_clusters",
-        dest="k",
+        "--k-range",
+        "--k_range",
+        dest="k_range",
         type=int,
-        default=50,
-        help="K-Means cluster count; must be between 20 and 100 (default: 50).",
+        nargs=2,
+        default=(50, 100),
+        metavar=("MIN", "MAX"),
+        help="Inclusive K range (default: 50 100; allowed range: 20 100).",
+    )
+    parser.add_argument(
+        "--groups",
+        "--num-groups",
+        "--num_groups",
+        dest="groups",
+        type=int,
+        default=12,
+        help="Number of K-Means groups to generate (default: 12).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        "--batch_size",
+        dest="batch_size",
+        type=int,
+        default=4096,
+        help="MiniBatchKMeans batch size (default: 4096).",
+    )
+    parser.add_argument(
+        "--max-iter",
+        "--max_iter",
+        dest="max_iter",
+        type=int,
+        default=100,
+        help="MiniBatchKMeans iterations (default: 100).",
+    )
+    parser.add_argument(
+        "--n-init",
+        "--n_init",
+        dest="n_init",
+        type=int,
+        default=3,
+        help="Number of MiniBatchKMeans initializations (default: 3).",
     )
     parser.add_argument("--seed", type=int, default=46)
     parser.add_argument(
-        "--seed-step", "--seed_step", dest="seed_step", type=int, default=1
-    )
-    parser.add_argument(
         "--prefix",
         default=None,
-        help="Output prefix (default: kmeans_k<K>).",
+        help="Output prefix (default: kmeans).",
     )
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument(
@@ -269,13 +323,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not 20 <= args.k <= 100:
-        raise ValueError("k must be between 20 and 100.")
+    if args.batch_size <= 0 or args.max_iter <= 0 or args.n_init <= 0:
+        raise ValueError("batch_size, max_iter, and n_init must be positive.")
+    k_min, k_max = args.k_range
+    k_values = choose_k_values(k_min, k_max, args.groups, args.seed)
 
     input_path = resolve_path(args.input)
     embedding_path = resolve_path(args.embedding_npz)
     output_dir = resolve_path(args.sft_output_dir)
-    prefix = args.prefix or f"kmeans_k{args.k}"
+    prefix = args.prefix or "kmeans"
     manifest_path = (
         resolve_path(args.manifest)
         if args.manifest is not None
@@ -284,22 +340,14 @@ def main() -> None:
 
     records = load_candidate_records(input_path)
     embeddings = load_embeddings(embedding_path, records)
-    if args.k > len(records):
-        raise ValueError(f"k ({args.k}) cannot exceed source size ({len(records)}).")
-
-    print(f"Fit K-Means: k={args.k}, rows={len(records)}")
-    labels = KMeans(
-        n_clusters=args.k,
-        n_init=15,
-        random_state=args.seed,
-    ).fit_predict(normalize(embeddings, axis=1))
-    index_groups, effective_seeds = build_indices(
-        labels, args.num_groups, args.sample_size, args.seed, args.seed_step
-    )
+    if k_max > len(records):
+        raise ValueError(f"k_max ({k_max}) cannot exceed source size ({len(records)}).")
+    if args.batch_size < k_max:
+        raise ValueError("batch_size must be at least k_max.")
 
     output_paths = [
         output_dir / f"{prefix}_{group_id:02d}.jsonl"
-        for group_id in range(1, args.num_groups + 1)
+        for group_id in range(1, args.groups + 1)
     ] + [manifest_path]
     existing_paths = [path for path in output_paths if path.exists()]
     if existing_paths and not args.overwrite:
@@ -308,10 +356,28 @@ def main() -> None:
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    normalize_embeddings(embeddings)
+    index_groups = []
     group_metadata = []
-    for group_id, (indices, group_seed) in enumerate(
-        zip(index_groups, effective_seeds), start=1
-    ):
+    for group_id, k in enumerate(k_values, start=1):
+        group_seed = args.seed + group_id - 1
+        print(
+            f"Fit MiniBatchKMeans: group={group_id}, k={k}, "
+            f"rows={len(records)}, batch_size={args.batch_size}"
+        )
+        labels = MiniBatchKMeans(
+            n_clusters=k,
+            batch_size=args.batch_size,
+            max_iter=args.max_iter,
+            n_init=args.n_init,
+            random_state=group_seed,
+        ).fit_predict(embeddings)
+        group_indices, _ = build_indices(
+            labels, 1, args.sample_size, group_seed, 1
+        )
+        indices = group_indices[0]
+        index_groups.append(indices)
+
         output_path = output_dir / f"{prefix}_{group_id:02d}.jsonl"
         selected = [
             {
@@ -327,6 +393,7 @@ def main() -> None:
             {
                 "group_id": group_id,
                 "name": f"{prefix}_{group_id:02d}",
+                "k": k,
                 "seed": group_seed,
                 "count": len(indices),
                 "candidate_indices": indices,
@@ -341,11 +408,15 @@ def main() -> None:
         "source_count": len(records),
         "index_field": "candidate_index",
         "index_base": 0,
-        "k": args.k,
-        "num_groups": args.num_groups,
+        "k_range": [k_min, k_max],
+        "selected_k_values": k_values,
+        "group_count": args.groups,
+        "batch_size": args.batch_size,
+        "max_iter": args.max_iter,
+        "n_init": args.n_init,
+        "num_groups": args.groups,
         "sample_size": args.sample_size,
         "base_seed": args.seed,
-        "seed_step": args.seed_step,
         "sampling": "cluster_balanced_with_random_fallback",
         "output_format": (
             "JSONL; each line is {candidate_index, sample_id, source, messages}"
@@ -362,7 +433,9 @@ def main() -> None:
                 "source_count": len(records),
                 "groups_created": len(group_metadata),
                 "sample_size": args.sample_size,
-                "k": args.k,
+                "k_range": [k_min, k_max],
+                "selected_k_values": k_values,
+                "batch_size": args.batch_size,
                 "sft_output_dir": relative_to_root(output_dir),
                 "manifest": relative_to_root(manifest_path),
             },

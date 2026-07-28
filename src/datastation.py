@@ -1,11 +1,12 @@
 import os
 import json
 import argparse
-from transformers import AutoTokenizer
 
 
 class DatasetAnalyzer:
     def __init__(self, dataset:str, tokenize_model:str='FacebookAI/xlm-roberta-large'):
+        from transformers import AutoTokenizer
+
         self.dataset = dataset
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenize_model,

@@ -8,7 +8,10 @@ import string
 import hashlib
 import numpy as np
 from tqdm import tqdm
-from datastation import DatasetAnalyzer
+try:
+    from .datastation import DatasetAnalyzer
+except ImportError:
+    from datastation import DatasetAnalyzer
 
 
 # if you want to use local models, fill it in here
